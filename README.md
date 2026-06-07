@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">Lomo</h1>
-<p align="center">你的飞书私人 AI 小秘书</p>
+<p align="center">你的飞书私人 AI 小助手</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/runtime-bun-ff69b4" alt="Bun">
