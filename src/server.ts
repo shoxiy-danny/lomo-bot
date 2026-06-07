@@ -2,7 +2,7 @@
 /**
  * Chat Agent Server — 独立飞书对话式助手 Agent
  *
- * 三层消息路由：系统命令 → 指令 → 普通对话
+ * 三层消息路由：破甲词(系统管理) → 场外指令(导演) → 普通对话
  * 固定上下文前缀 + prompt caching
  * 语音管道：Doubao ASR + MiMo TTS
  */
@@ -196,17 +196,18 @@ function isSessionTimedOut(session: Session): boolean {
 const INIT_MODEL = 'deepseek-v4-pro'
 const TOOL_MODEL = 'deepseek-v4-flash'  // DSF：工具调用兜底模型（M3 幻觉严重时切这个）
 
-// 需要强制 DSF 的关键词（米家控制 / 设备操作）
-const FORCE_DSF_RE = /开灯|关灯|开空调|关空调|开大灯|关大灯|打开.*灯|关闭.*灯|打开.*空调|关闭.*空调|调亮度|调色温|空调\d+度|灯.*开|灯.*关|设备.*开|设备.*关/
+// 需要强制 DSF 的关键词（米家查询/控制 + 搜索 + 时间等工具密集型场景）
+// M3 在这些场景下严重幻觉，必须切 DSF 确保工具调用
+const FORCE_DSF_RE = /开灯|关灯|开空调|关空调|开大灯|关大灯|打开.*灯|关闭.*灯|打开.*空调|关闭.*空调|调亮度|调色温|空调\d+度|灯.*开|灯.*关|设备.*开|设备.*关|几度|多少度|温度|湿度|开了没|关了吗|状态|亮度|色温|模式|电量|功率|传感器|插座|开关|窗帘|晾衣架|风扇|台灯|夜灯|音响|米家|mijia|看看.*设备|查.*设备|列.*设备|有什么设备|几个设备|家里.*设备|现在几点|今天几号|搜一下|帮我查|帮我找|搜.*新闻|天气预报|天气怎么样/
 
 /** 选 LLM 模型：profile 未初始化或涉及工具密集操作时强制用 DSF */
 function pickModelForCall(session: Session, userText?: string): string {
   if (!isProfileInitialized(session.characterName)) {
     return INIT_MODEL
   }
-  // 米家控制意图 → 强制 DSF（M3 幻觉工具调用太严重）
+  // 工具密集型查询 → 强制 DSF（M3 幻觉严重，不调工具）
   if (userText && FORCE_DSF_RE.test(userText)) {
-    process.stderr.write(`[model] force DSF for mijia intent: ${userText.slice(0, 50)}\n`)
+    process.stderr.write(`[model] force DSF: ${userText.slice(0, 50)}\n`)
     return TOOL_MODEL
   }
   return session.model
@@ -409,10 +410,10 @@ async function handleMessage(chatId: string, text: string, senderId: string, mes
     case 'system':
       await handleSystemCommand(chatId, session, result.command, senderId)
       break
-    case 'instruction':
-      await handleInstruction(chatId, session, result.instruction, result.userText, senderId)
+    case 'ooc':
+      await handleOOC(chatId, session, result.instruction, result.userText, senderId)
       break
-    case 'chat':
+    case 'character':
       await handleCharacter(chatId, session, result.text, senderId)
       break
   }
@@ -871,7 +872,7 @@ async function handleSelection(chatId: string, session: Session, type: string, v
   }
 }
 
-// ── 普通对话 ──────────────────────────────────────────────────────
+// ── 普通角色对话 ──────────────────────────────────────────────────
 
 /** 兜底检测 M3 文本式 <tool_call> 块，转成原生 toolCalls，返回清洗后的 content */
 function detectXmlToolCalls(resp: { toolCalls?: ToolCall[]; content?: string }): string {
@@ -1141,17 +1142,17 @@ async function handleCharacter(chatId: string, session: Session, text: string, s
   }
 }
 
-// ── 指令处理 ──────────────────────────────────────────────────────
+// ── 场外指令处理 ──────────────────────────────────────────────────
 
-async function handleInstruction(chatId: string, session: Session, instruction: string, userText: string, senderId: string): Promise<void> {
-  // 构建带指令的 user message
-  let instructionMessage = `[指令] ${instruction}`
+async function handleOOC(chatId: string, session: Session, instruction: string, userText: string, senderId: string): Promise<void> {
+  // 构建带场外指令的 user message
+  let oocMessage = `[场外指令] ${instruction}`
   if (userText) {
-    instructionMessage += `\n\n---\n${userText}`
+    oocMessage += `\n\n---\n${userText}`
   }
 
-  // 同普通对话处理
-  const userMsg: Message = { role: 'user', content: instructionMessage, ts: new Date().toISOString() }
+  // 同角色对话处理
+  const userMsg: Message = { role: 'user', content: oocMessage, ts: new Date().toISOString() }
   session.messages.push(userMsg)
   saveSession(session)
 
@@ -1522,7 +1523,7 @@ async function feishuReply(chatId: string, text: string): Promise<void> {
   }
 }
 
-// 普通对话专用：始终用 card 富文本格式
+// 角色对话专用：始终用 card 富文本格式
 async function feishuCardReply(chatId: string, text: string): Promise<void> {
   try {
     const card = markdownToCard('', text)
@@ -1834,8 +1835,9 @@ async function toBuffer(resp: any): Promise<Buffer | null> {
 // ── 启动 ──────────────────────────────────────────────────────────
 
 // Health check HTTP server
-// ── HTTP API ─────────────────────────────────────────────────────
+// ── HTTP API & Admin ──────────────────────────────────────────────
 
+const ADMIN_HTML_PATH = join(import.meta.dir, '..', 'public', 'admin.html')
 const USD_TO_CNY = 7.2
 
 function apiJson(data: any, status = 200): Response {
@@ -1864,6 +1866,14 @@ Bun.serve({
     }
 
     try {
+      // ── 管理页面 ──
+      if (pathname === '/admin' || pathname === '/admin.html') {
+        if (existsSync(ADMIN_HTML_PATH)) {
+          const html = readFileSync(ADMIN_HTML_PATH, 'utf8')
+          return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+        }
+        return new Response('Admin page not found. Create public/admin.html', { status: 404 })
+      }
 
       // ── Health ──
       if (pathname === '/health') {

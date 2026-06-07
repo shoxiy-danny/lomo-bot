@@ -130,6 +130,9 @@ export const minimaxProvider: LLMProvider = {
     if (options.temperature !== undefined) body.temperature = options.temperature
     if (options.tools && options.tools.length > 0) {
       body.tools = toAnthropicTools(options.tools)
+      if (options.toolChoice) {
+        body.tool_choice = options.toolChoice
+      }
     }
 
     const resp = await fetch('https://api.minimaxi.com/anthropic/v1/messages', {

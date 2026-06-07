@@ -33,7 +33,7 @@ export interface ChatOptions {
   temperature?: number
   stream?: boolean
   tools?: ToolDef[]
-  toolChoice?: 'auto' | 'required' | 'none'
+  toolChoice?: 'auto' | 'required' | 'none' | { type: 'auto' | 'any' | 'none' } | { type: 'tool'; name: string }
 }
 
 export interface ChatResponse {
