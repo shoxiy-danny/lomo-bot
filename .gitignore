@@ -1,0 +1,41 @@
+# ── 敏感信息：永不提交 ───────────────────────────────────────
+state/.env
+state/.env.*
+!state/.env.example
+
+# ── 运行时数据：聊天记录 / 记忆 / 日志 ──────────────────────
+state/sessions/
+state/memory/
+state/inbox/
+state/active.json
+state/tts.json
+state/reminders.json
+state/llm-logs.jsonl
+state/notes.json
+
+# ── 日志 ─────────────────────────────────────────────────────
+lomo.log
+lomo.log.*
+*.log
+
+# ── Node / Bun ──────────────────────────────────────────────
+node_modules/
+
+# ── 临时文件 ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+*.bak
+
+# ── 编辑器 ──────────────────────────────────────────────────
+.vscode/
+.idea/
+*.iml
+
+# ── 主动消息状态 ─────────────────────────────────────────────
+state/proactive.json
+state/location.json
+
+# ── 米家脚本：venv 不入仓，部署时本地装 ──────────────────────
+scripts/venv/

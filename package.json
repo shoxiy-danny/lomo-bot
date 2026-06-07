@@ -1,0 +1,35 @@
+{
+  "name": "lomo",
+  "version": "1.0.0",
+  "description": "飞书个人 AI 助手 — 记忆/主动消息/语音/23 工具/智能家居/定时任务",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shoxiy-danny/lomo-bot"
+  },
+  "keywords": [
+    "feishu",
+    "lark",
+    "ai-assistant",
+    "chatbot",
+    "llm",
+    "agent",
+    "smart-home",
+    "personal-assistant",
+    "bun",
+    "typescript"
+  ],
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "scripts": {
+    "dev": "bun run --watch src/server.ts",
+    "start": "bun run src/server.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.100.1",
+    "@larksuiteoapi/node-sdk": "^1.36.0",
+    "openai": "^6.39.1"
+  }
+}
