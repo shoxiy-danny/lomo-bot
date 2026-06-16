@@ -2,7 +2,7 @@
  * Memory Tools — 6 个 tool calling 定义 + 执行器
  *
  * 注册到 Lomo 现有 TOOLS 数组后，LLM 可在对话中自主调 memory_store / memory_recall。
- * memory_update / memory_delete / memory_list 仅供 /memory 命令或主人直接使用，
+ * memory_update / memory_delete / memory_list 仅供 /memory 命令或主人 OOC 使用，
  * 安全规则：LLM 不可自主调 update/delete（防误删）
  *
  * v1 实现：
@@ -153,7 +153,7 @@ export const PROFILE_UPDATE_TOOL: ToolDef = {
           enum: ['set', 'append', 'remove'],
           description: 'set=覆盖, append=追加, remove=删除',
         },
-        value: { type: 'string', description: 'JSON 序列化的值。例：preferred_name 直接传 "小明"；core_habits 传 [{"habit":"习惯早起","source":"llm"}]；core_contacts 传 {"小明":"同事"}' },
+        value: { type: 'string', description: 'JSON 序列化的值。例：preferred_name 直接传 "Alice"；core_habits 传 [{"habit":"不吃早饭","source":"llm"}]；core_contacts 传 {"小明":"同事"}' },
       },
       required: ['field', 'action', 'value'],
     },

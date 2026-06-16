@@ -9,12 +9,12 @@
 import type { ToolDef, ToolCall } from './llm/types'
 import { MEMORY_TOOLS, executeMemoryTool, type MemoryToolResult } from './memory/tools'
 import { addReminder, deleteReminder, listReminders, updateReminder } from './reminders'
-import { addNote, deleteNote, listNotes, searchNotes } from './notes'
+import { addNote, updateNote, deleteNote, listNotes, findNote, type MatchResult } from './notes'
 import { getCurrentLocation, type LocationData } from './location'
 import { searchArchive } from './memory/archive'
 import { execSync } from 'child_process'
 import { join } from 'path'
-import { appendFileSync } from 'fs'
+import { appendFileSync, mkdirSync, writeFileSync, readFileSync, statSync, unlinkSync } from 'fs'
 
 // ── 工具定义（给 LLM API 注册用） ──────────────────────────────────
 
@@ -40,13 +40,39 @@ export const IMAGE_GEN_TOOL: ToolDef = {
   type: 'function',
   function: {
     name: 'image_gen',
-    description: '根据文字描述生成图片。描述越详细效果越好——包含主体、环境、光线、色调、风格（如写实/动漫/水墨）',
+    description: '根据文字描述生成图片（异步）。调用后立即返回，图片生成完成后系统会自动发送到聊天中。描述越详细效果越好——包含主体、环境、光线、色调。**默认出写实风格**，除非用户明确要求动漫/卡通/水墨等其他风格。',
     parameters: {
       type: 'object',
       properties: {
         prompt: {
           type: 'string',
           description: '图片描述：用中文详细描述画面，包含主体、环境、光线、色彩、风格等',
+        },
+        reference_image: {
+          type: 'string',
+          description: '参考图片（可选）：公网URL或base64格式。传入后做图生图/风格参考',
+        },
+      },
+      required: ['prompt'],
+    },
+  },
+}
+
+export const VIDEO_GEN_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'video_gen',
+    description: '根据文字描述生成短视频（3~15秒，24FPS）。支持写实/电影风格和运镜指令（推进/拉远/左移/右移/上升/下降等）。生成约需1~3分钟，完成后会自动发送。',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: {
+          type: 'string',
+          description: '视频描述：详细描述画面内容和镜头运动，包含主体、场景、光线、色调、风格（写实/电影/动漫等）。支持运镜指令如[推进][拉远][左移]等',
+        },
+        duration: {
+          type: 'number',
+          description: '视频时长（秒），默认 6，最长 15（24FPS）',
         },
       },
       required: ['prompt'],
@@ -117,6 +143,7 @@ export const TASK_CREATE_TOOL: ToolDef = {
         prompt: { type: 'string', description: '任务执行指令，如"搜索今日AI行业新闻，按标题+摘要+来源格式整理"' },
         cron: { type: 'string', description: 'cron 表达式，如"0 9 * * 1-5"表示工作日9点，"30 8 * * *"表示每天8:30' },
         label: { type: 'string', description: '任务名称，如"AI日报"' },
+        session: { type: 'boolean', description: '任务回复是否追加到对话 session（true=用户下次对话能看到任务结果并继续聊）' },
       },
       required: ['prompt', 'cron', 'label'],
     },
@@ -179,24 +206,26 @@ export const TASK_UPDATE_TOOL: ToolDef = {
         cron: { type: 'string', description: '新的 cron 表达式' },
         label: { type: 'string', description: '新的任务名称' },
         enabled: { type: 'boolean', description: '启用/禁用' },
+        session: { type: 'boolean', description: '任务回复是否追加到对话 session' },
       },
       required: ['id'],
     },
   },
 }
 
-// ── 随手记工具定义 ───────────────────────────────────────────────
+// ── 随手记工具定义（v2）───────────────────────────────────────────
 
 export const NOTE_SAVE_TOOL: ToolDef = {
   type: 'function',
   function: {
     name: 'note_save',
-    description: '保存用户指定的内容。当用户说"记一下"、"帮我记"、"备忘"时使用。不要用于自动提取用户画像——那是记忆系统的职责。',
+    description: '保存一条新笔记。当用户说"记一下"、"帮我记"、"备忘"、"加入片单"、"收藏"时使用。category 根据内容推断：工作/项目/开会→"工作日志"，电影/剧/片单→"片单"，推文/文章/链接→"收藏"，其他→"默认"。',
     parameters: {
       type: 'object',
       properties: {
-        content: { type: 'string', description: '用户要求记录的内容原文' },
-        tags: { type: 'array', items: { type: 'string' }, description: '可选标签，如 ["工作","待办"]' },
+        content: { type: 'string', description: '要记录的内容原文' },
+        category: { type: 'string', description: '分类，如"工作日志"、"片单"、"收藏"。不传默认"默认"' },
+        tags: { type: 'array', items: { type: 'string' }, description: '可选标签' },
       },
       required: ['content'],
     },
@@ -207,22 +236,33 @@ export const NOTE_LIST_TOOL: ToolDef = {
   type: 'function',
   function: {
     name: 'note_list',
-    description: '列出用户最近保存的笔记。',
-    parameters: { type: 'object', properties: {} },
-  },
-}
-
-export const NOTE_SEARCH_TOOL: ToolDef = {
-  type: 'function',
-  function: {
-    name: 'note_search',
-    description: '搜索用户的笔记。用关键词查找之前记录的内容。',
+    description: '列出或搜索笔记。不传参数=列出最近30条；传 category=按分类筛选；传 keyword=关键词搜索。返回完整 id，可用于 note_update 或 note_delete。',
     parameters: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: '搜索关键词' },
+        category: { type: 'string', description: '按分类筛选，如"工作日志"、"片单"' },
+        keyword: { type: 'string', description: '关键词搜索（匹配内容和标签）' },
+        limit: { type: 'number', description: '返回条数，默认30' },
       },
-      required: ['query'],
+    },
+  },
+}
+
+export const NOTE_UPDATE_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'note_update',
+    description: '更新已有笔记。必须提供 id 或 keyword（二选一）。id 从 note_save 返回值或 note_list 结果中复制，绝对不准自己编。content=完全替换内容；append=追加到末尾（二选一，同时传 content 生效）。可同时更新 category 和 tags。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '笔记 id（从 note_save 或 note_list 结果中复制）' },
+        keyword: { type: 'string', description: '关键词匹配要更新的笔记（id 和 keyword 二选一，优先用 id）' },
+        content: { type: 'string', description: '新内容（完全替换）' },
+        append: { type: 'string', description: '追加到现有内容末尾' },
+        category: { type: 'string', description: '新分类' },
+        tags: { type: 'array', items: { type: 'string' }, description: '新标签' },
+      },
     },
   },
 }
@@ -231,13 +271,13 @@ export const NOTE_DELETE_TOOL: ToolDef = {
   type: 'function',
   function: {
     name: 'note_delete',
-    description: '按 id 删除一条笔记。',
+    description: '删除一条笔记。必须提供 id 或 keyword（二选一）。id 从 note_save 或 note_list 结果中复制，绝对不准自己编。keyword 匹配到多条时返回候选，不盲删。',
     parameters: {
       type: 'object',
       properties: {
-        id: { type: 'string', description: '笔记的 id' },
+        id: { type: 'string', description: '笔记 id（从 note_save 或 note_list 结果中复制）' },
+        keyword: { type: 'string', description: '关键词匹配要删除的笔记（id 和 keyword 二选一，优先用 id）' },
       },
-      required: ['id'],
     },
   },
 }
@@ -258,7 +298,7 @@ const FORBIDDEN_CMDS = new Set([
 
 const READONLY_GIT_SUB = new Set(['log', 'show', 'diff', 'status', 'branch', 'tag', 'blame', 'stash'])
 
-const LOMO_WORKSPACE = join(process.env.HOME || '/home/user', 'Projects', 'Lomo')
+const LOMO_WORKSPACE = join(process.env.HOME || '/tmp', 'Projects', 'Lomo')
 
 export const BASH_EXEC_TOOL: ToolDef = {
   type: 'function',
@@ -299,7 +339,7 @@ export const MIJIA_LIST_TOOL: ToolDef = {
   type: 'function',
   function: {
     name: 'mijia_list',
-    description: '列出主人家所有米家智能家居设备（灯/空调/音箱/插座/传感器等）。返回 JSON 包含 did、name、model、online、room。',
+    description: '列出老板家所有米家智能家居设备（灯/空调/音箱/插座/传感器等）。返回 JSON 包含 did、name、model、online、room。',
     parameters: { type: 'object', properties: {}, required: [] },
   },
 }
@@ -323,7 +363,7 @@ export const MIJIA_SET_TOOL: ToolDef = {
   type: 'function',
   function: {
     name: 'mijia_set',
-    description: '控制米家设备。name 设备名，prop 属性（power/brightness/color_temp/temp/mode/fan_level），value 目标值（on/off/数字）。调用前置：用户当前消息**明确**说要做某个设备动作（如"开灯"、"调暗一点"）。禁止在用户没要求时调用，禁止主动消息调用，禁止从上下文推断/联想调用。',
+    description: '控制米家设备开关/调亮度/调色温。name=设备名，prop=属性（power/brightness/color_temp），value=目标值（开=on/关=off/数字）。举例：关灯→mijia_set("大灯","power","off")；开灯→mijia_set("大灯","power","on")；调亮→mijia_set("大灯","brightness","80")。调用前置：用户明确说要做设备动作。禁止在用户没要求时调用。',
     parameters: {
       type: 'object',
       properties: {
@@ -445,7 +485,7 @@ export function execBash(command: string): { result: string } {
       maxBuffer: 64 * 1024,
       encoding: 'utf8',
       cwd: LOMO_WORKSPACE,
-      env: { ...process.env, HOME: process.env.HOME || '/home/user' },
+      env: { ...process.env, HOME: process.env.HOME || '/tmp' },
     })
     const trimmed = stdout.slice(0, 4000)
     console.log(`[bash_exec] OK len=${stdout.length} trimmed=${trimmed.length}`)
@@ -458,11 +498,11 @@ export function execBash(command: string): { result: string } {
 }
 
 export const TOOLS: ToolDef[] = [
-  SEARCH_TOOL, IMAGE_GEN_TOOL, GET_TIME_TOOL,
+  SEARCH_TOOL, IMAGE_GEN_TOOL, VIDEO_GEN_TOOL, GET_TIME_TOOL,
   ...MEMORY_TOOLS,
   REMINDER_CREATE_TOOL, REMINDER_LIST_TOOL, REMINDER_DELETE_TOOL, REMINDER_UPDATE_TOOL,
   TASK_CREATE_TOOL, TASK_LIST_TOOL, TASK_DELETE_TOOL, TASK_UPDATE_TOOL,
-  NOTE_SAVE_TOOL, NOTE_LIST_TOOL, NOTE_SEARCH_TOOL, NOTE_DELETE_TOOL,
+  NOTE_SAVE_TOOL, NOTE_LIST_TOOL, NOTE_UPDATE_TOOL, NOTE_DELETE_TOOL,
   BASH_EXEC_TOOL,
   MIJIA_LIST_TOOL, MIJIA_GET_TOOL, MIJIA_SET_TOOL,
   NEARBY_SEARCH_TOOL,
@@ -632,10 +672,63 @@ export async function webSearch(query: string): Promise<string> {
   }
 }
 
-// ── Image Generation（MiniMax API） ────────────────────────────────
+// ── Image Generation（Agnes 主 → MiniMax fallback）──────────────────
 
-export async function imageGen(prompt: string): Promise<{ text: string; imageUrl: string }> {
-  if (!getMiniMaxKey()) { return { text: '（生图不可用：未配置 MINIMAX_API_KEY）', imageUrl: '' } }
+function getAgnesKey(): string {
+  return process.env.AGNES_API_KEY || ''
+}
+
+function getAgnesFallbackKey(): string {
+  return process.env.AGNES_API_KEY_FALLBACK || ''
+}
+
+function resolveImageSource(source: string): string {
+  if (source.startsWith('data:')) return source
+  if (source.startsWith('http://') || source.startsWith('https://')) return source
+  // 本地文件 → base64
+  const buf = readFileSync(source)
+  const ext = source.split('.').pop()?.toLowerCase() || 'png'
+  const mime: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' }
+  return `data:${mime[ext] || 'image/png'};base64,${buf.toString('base64')}`
+}
+
+async function agnesImageGen(prompt: string, referenceImage?: string): Promise<string | null> {
+  const keys = [getAgnesKey(), getAgnesFallbackKey()].filter(Boolean)
+  if (keys.length === 0) return null
+  for (const key of keys) {
+    try {
+      const extraBody: Record<string, unknown> = { response_format: 'url' }
+      if (referenceImage) extraBody.image = [resolveImageSource(referenceImage)]
+      const resp = await fetch('https://apihub.agnes-ai.com/v1/images/generations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${key}`,
+        },
+        body: JSON.stringify({
+          model: 'agnes-image-2.1-flash',
+          prompt,
+          size: '1024x1024',
+          extra_body: extraBody,
+        }),
+      })
+      if (resp.ok) {
+        const data = await resp.json() as any
+        const url = data.data?.[0]?.url
+        if (url) return url
+      }
+    } catch {}
+  }
+  return null
+}
+
+export async function imageGen(prompt: string, referenceImage?: string): Promise<{ text: string; imageUrl: string }> {
+  // 主路径：Agnes（付费 → 免费降级）
+  const agnesUrl = await agnesImageGen(prompt, referenceImage)
+  if (agnesUrl) return { text: '图片已生成 (Agnes)', imageUrl: agnesUrl }
+
+  // fallback: MiniMax
+  if (!getMiniMaxKey()) return { text: '（生图不可用）', imageUrl: '' }
 
   try {
     const resp = await fetch('https://api.minimax.chat/v1/image_generation', {
@@ -650,14 +743,117 @@ export async function imageGen(prompt: string): Promise<{ text: string; imageUrl
         n: 1,
       }),
     })
-
     if (!resp.ok) return { text: `（生图失败: ${resp.status}）`, imageUrl: '' }
     const data = await resp.json() as any
     const urls = data?.data?.image_urls || []
     const imageUrl = Array.isArray(urls) && urls.length > 0 ? urls[0] : ''
-    return { text: imageUrl ? '图片已生成' : '（生图无结果）', imageUrl }
+    return { text: imageUrl ? '图片已生成 (MiniMax)' : '（生图无结果）', imageUrl }
   } catch (err: any) {
     return { text: `（生图出错: ${err.message}）`, imageUrl: '' }
+  }
+}
+
+// ── Video Generation（Agnes 视频 API）────────────────────────────
+
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
+
+/** Agnes 视频生成（付费 → 免费降级） */
+export async function videoGen(prompt: string, duration: number = 6): Promise<{ text: string; videoFile?: string; downloadUrl?: string }> {
+  const keys = [getAgnesKey(), getAgnesFallbackKey()].filter(Boolean)
+  if (keys.length === 0) return { text: '（视频生成不可用：未配置 AGNES_API_KEY）' }
+  for (const key of keys) {
+    const result = await videoGenWithKey(key, prompt, duration)
+    if (!result.text.startsWith('（') || keys.length === 1) return result
+  }
+  return { text: '（视频生成失败：所有 key 均不可用）' }
+}
+
+async function videoGenWithKey(key: string, prompt: string, duration: number): Promise<{ text: string; videoFile?: string; downloadUrl?: string }> {
+
+  // 1. 创建任务
+  const numFrames = Math.min(Math.round(duration * 24 / 8) * 8 + 1, 360)  // 24FPS ≤15s
+  const actualDuration = (numFrames / 24).toFixed(1)
+  const body = {
+    model: 'agnes-video-v2.0',
+    prompt,
+    width: 1152,
+    height: 768,
+    num_frames: numFrames,
+    frame_rate: 24,
+  }
+
+  try {
+    const createResp = await fetch('https://apihub.agnes-ai.com/v1/videos', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!createResp.ok) {
+      const errText = await createResp.text().catch(() => '')
+      return { text: `（视频创建失败: ${createResp.status} ${errText.slice(0, 100)}）` }
+    }
+    const createData = await createResp.json() as any
+    const videoId = createData.video_id || createData.id
+    if (!videoId) return { text: '（视频创建未返回 video_id）' }
+
+    // 2. 轮询
+    const startedAt = Date.now()
+    const deadline = startedAt + 10 * 60_000
+    let downloadUrl: string | undefined
+
+    while (Date.now() < deadline) {
+      await sleep(15_000)
+      const qResp = await fetch(`https://apihub.agnes-ai.com/agnesapi?video_id=${encodeURIComponent(videoId)}`, {
+        headers: { Authorization: `Bearer ${key}` },
+      })
+      if (!qResp.ok) continue
+      const qData = await qResp.json() as any
+      if (qData.status === 'completed') {
+        downloadUrl = qData.download_url || qData.result?.video?.download_url || qData.video?.url || qData.remixed_from_video_id
+        break
+      }
+      if (qData.status === 'failed') return { text: '（视频生成失败）' }
+    }
+
+    if (!downloadUrl) return { text: '（视频生成超时）' }
+
+    // 3. 下载（30s 超时，VIDEO_PROXY 环境变量支持走代理）
+    let buf: Buffer | null = null
+    try {
+      const abort = AbortSignal.timeout(30_000)
+      const dlResp = await fetch(downloadUrl, { signal: abort })
+      if (dlResp.ok) {
+        buf = Buffer.from(await dlResp.arrayBuffer())
+      }
+    } catch {}
+    if (!buf) {
+      // 直连失败 + 有代理 → curl 重试
+      const proxyUrl = process.env.VIDEO_PROXY
+      if (proxyUrl) {
+        const proxyOutDir = join(process.env.HOME || '/tmp', 'Projects', 'Lomo', 'state', 'inbox')
+        mkdirSync(proxyOutDir, { recursive: true })
+        const tmpPath = join(proxyOutDir, `video_${Date.now()}.mp4`)
+        try {
+          const { execSync } = await import('child_process')
+          execSync(`curl -x "${proxyUrl}" -sS -o "${tmpPath}" --connect-timeout 10 --max-time 60 "${downloadUrl}"`, { timeout: 70_000 })
+          const stat = statSync(tmpPath)
+          if (stat.size > 0) {
+            buf = readFileSync(tmpPath)
+          }
+        } catch {}
+        if (!buf) try { unlinkSync(tmpPath) } catch {}
+      }
+    }
+    if (!buf) return { text: '（视频下载失败：直连超时且代理不可用）', downloadUrl }
+
+    const outDir = join(process.env.HOME || '/tmp', 'Projects', 'Lomo', 'state', 'inbox')
+    mkdirSync(outDir, { recursive: true })
+    const filePath = join(outDir, `video_${Date.now()}.mp4`)
+    writeFileSync(filePath, buf)
+
+    return { text: `视频已生成 (${actualDuration}s, ${(buf.length / 1024 / 1024).toFixed(1)}MB)`, videoFile: filePath }
+  } catch (err: any) {
+    return { text: `（视频生成出错: ${err.message.slice(0, 100)}）` }
   }
 }
 
@@ -720,10 +916,11 @@ async function nearbySearch(
 // ── 原生 ToolCall 执行 ────────────────────────────────────────────
 
 export interface ToolResult {
-  type: 'search' | 'image' | 'memory' | 'reminder' | 'note'
+  type: 'search' | 'image' | 'video' | 'memory' | 'reminder' | 'note'
   query: string
   result: string
   imageUrl?: string
+  videoFile?: string   // 视频生成后本地文件路径
   toolCallId?: string
 }
 
@@ -742,8 +939,11 @@ export async function executeNativeToolCalls(
         const result = await webSearch(args.query || '')
         results.push({ type: 'search', query: args.query || '', result, toolCallId: tc.id })
       } else if (tc.function.name === 'image_gen') {
-        const { text, imageUrl } = await imageGen(args.prompt || '')
-        results.push({ type: 'image', query: args.prompt || '', result: text, imageUrl, toolCallId: tc.id })
+        // 异步：生成由 server.ts 的 runToolLoop 统一 fire-and-forget
+        results.push({ type: 'image', query: args.prompt || '', result: '图片正在生成，完成后会自动发送。', toolCallId: tc.id })
+      } else if (tc.function.name === 'video_gen') {
+        // 异步：生成由 server.ts 的 runToolLoop 统一 fire-and-forget
+        results.push({ type: 'video', query: args.prompt || '', result: '视频正在生成（约1~3分钟），完成后会自动发送。', toolCallId: tc.id })
       } else if (tc.function.name === 'get_time') {
         const ts = Date.now() + 8 * 60 * 60 * 1000
         const d = new Date(ts)
@@ -796,6 +996,7 @@ export async function executeNativeToolCalls(
             prompt: args.prompt,
             label: args.label,
             cron: args.cron,
+            session: args.session === true ? true : undefined,
             fireAt: Date.now() + 60_000,
             enabled: true,
           })
@@ -812,7 +1013,8 @@ export async function executeNativeToolCalls(
           const lines = filtered.map(r => {
             const time = new Date(r.fireAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
             const status = r.enabled ? '✓' : '✗'
-            return `${status} [${r.id.slice(0, 8)}] ${r.label || r.text || r.prompt} — ${r.type === 'once' ? time : r.cron}`
+            const sess = r.session ? ' [进session]' : ''
+            return `${status} [${r.id.slice(0, 8)}] ${r.label || r.text || r.prompt} — ${r.type === 'once' ? time : r.cron}${sess}`
           })
           results.push({ type: 'reminder', query: tc.function.name, result: lines.join('\n') })
         }
@@ -826,6 +1028,7 @@ export async function executeNativeToolCalls(
         if (args.prompt !== undefined) patch.prompt = args.prompt
         if (args.cron !== undefined) patch.cron = args.cron
         if (args.enabled !== undefined) patch.enabled = args.enabled
+        if (args.session !== undefined) patch.session = args.session
         if (args.fire_at) {
           const fireAt = new Date(args.fire_at).getTime()
           if (isNaN(fireAt)) {
@@ -837,34 +1040,57 @@ export async function executeNativeToolCalls(
         const updated = updateReminder(args.id, patch)
         results.push({ type: 'reminder', query: tc.function.name, result: updated ? `已更新 ${Object.keys(patch).join('、')}。` : '找不到该 id。' })
       } else if (tc.function.name === 'note_save') {
-        const entry = addNote(args.content, args.tags || [])
-        results.push({ type: 'note', query: 'note_save', result: `笔记已保存。id: ${entry.id.slice(0, 8)}` })
+        const entry = addNote(args.content, args.category || '默认', args.tags || [])
+        results.push({ type: 'note', query: 'note_save', result: `已保存 [${entry.category}] id=${entry.id}\n内容: ${entry.content.slice(0, 60)}` })
       } else if (tc.function.name === 'note_list') {
-        const notes = listNotes()
+        const { notes, total } = listNotes({ category: args.category, keyword: args.keyword, limit: args.limit })
         if (notes.length === 0) {
-          results.push({ type: 'note', query: 'note_list', result: '暂无笔记。' })
+          results.push({ type: 'note', query: 'note_list', result: `暂无笔记${args.category ? `（分类：${args.category}）` : ''}${args.keyword ? `（关键词：${args.keyword}）` : ''}。` })
         } else {
           const lines = notes.map(n => {
             const time = new Date(n.createdAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
             const tags = n.tags.length > 0 ? ` [${n.tags.join(',')}]` : ''
-            return `- [${n.id.slice(0, 8)}] ${n.content.slice(0, 60)}${tags} (${time})`
+            return `- [${n.id}] [${n.category}] ${n.content.slice(0, 80)}${tags} (${time})`
           })
-          results.push({ type: 'note', query: 'note_list', result: lines.join('\n') })
+          const header = args.keyword ? `搜索"${args.keyword}"` : (args.category ? `分类：${args.category}` : '全部笔记')
+          results.push({ type: 'note', query: 'note_list', result: `${header}（${total}条，显示前${notes.length}条）\n${lines.join('\n')}` })
         }
-      } else if (tc.function.name === 'note_search') {
-        const notes = searchNotes(args.query || '')
-        if (notes.length === 0) {
-          results.push({ type: 'note', query: 'note_search', result: `没有找到与"${args.query}"相关的笔记。` })
+      } else if (tc.function.name === 'note_update') {
+        if (!args.id && !args.keyword) {
+          results.push({ type: 'note', query: 'note_update', result: '必须提供 id 或 keyword 参数。' })
         } else {
-          const lines = notes.map(n => {
-            const time = new Date(n.createdAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-            return `- [${n.id.slice(0, 8)}] ${n.content} (${time})`
-          })
-          results.push({ type: 'note', query: 'note_search', result: lines.join('\n') })
+          const match = findNote({ id: args.id, keyword: args.keyword })
+          if (match.type === 'not_found') {
+            results.push({ type: 'note', query: 'note_update', result: `找不到该笔记。${args.id ? 'id: ' + args.id.slice(0, 8) : 'keyword: ' + args.keyword}` })
+          } else if (match.type === 'ambiguous') {
+            const lines = match.candidates!.map(n => {
+              const time = new Date(n.createdAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+              return `- [${n.id}] ${n.content.slice(0, 60)} (${time})`
+            })
+            results.push({ type: 'note', query: 'note_update', result: `找到${match.candidates!.length}条匹配，请用 id 指定：\n${lines.join('\n')}` })
+          } else {
+            const updated = updateNote(match.note!.id, { content: args.content, append: args.append, category: args.category, tags: args.tags })
+            results.push({ type: 'note', query: 'note_update', result: `已更新。id=${updated!.id}\n内容: ${updated!.content.slice(0, 80)}` })
+          }
         }
       } else if (tc.function.name === 'note_delete') {
-        const ok = deleteNote(args.id)
-        results.push({ type: 'note', query: 'note_delete', result: ok ? '已删除。' : '找不到该 id。' })
+        if (!args.id && !args.keyword) {
+          results.push({ type: 'note', query: 'note_delete', result: '必须提供 id 或 keyword 参数。' })
+        } else {
+          const match = findNote({ id: args.id, keyword: args.keyword })
+          if (match.type === 'not_found') {
+            results.push({ type: 'note', query: 'note_delete', result: `找不到该笔记。${args.id ? 'id: ' + args.id.slice(0, 8) : 'keyword: ' + args.keyword}` })
+          } else if (match.type === 'ambiguous') {
+            const lines = match.candidates!.map(n => {
+              const time = new Date(n.createdAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+              return `- [${n.id}] ${n.content.slice(0, 60)} (${time})`
+            })
+            results.push({ type: 'note', query: 'note_delete', result: `找到${match.candidates!.length}条匹配，请用 id 指定要删除的：\n${lines.join('\n')}` })
+          } else {
+            deleteNote(match.note!.id)
+            results.push({ type: 'note', query: 'note_delete', result: `已删除。id=${match.note!.id}` })
+          }
+        }
       } else if (tc.function.name === 'bash_exec') {
         const { result } = execBash(args.command || '')
         results.push({ type: 'search', query: 'bash_exec', result })
@@ -905,8 +1131,9 @@ export async function executeNativeToolCalls(
         results[results.length - 1].toolCallId = tc.id
       }
     } catch (err: any) {
-      let toolType: 'search' | 'image' | 'memory' | 'reminder' | 'note' = 'search'
+      let toolType: 'search' | 'image' | 'video' | 'memory' | 'reminder' | 'note' = 'search'
       if (tc.function.name === 'image_gen') toolType = 'image'
+      else if (tc.function.name === 'video_gen') toolType = 'video'
       else if (tc.function.name.startsWith('memory_') || tc.function.name === 'profile_update') toolType = 'memory'
       else if (tc.function.name.startsWith('reminder_') || tc.function.name.startsWith('task_')) toolType = 'reminder'
       else if (tc.function.name.startsWith('note_')) toolType = 'note'

@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { join } from 'path'
 
-const HOME = process.env.HOME || '/home/user'
+const HOME = process.env.HOME || '/tmp'
 const STATE_DIR = join(HOME, 'Projects', 'Lomo', 'state')
 const PROACTIVE_FILE = join(STATE_DIR, 'proactive.json')
 

@@ -15,7 +15,7 @@ import { join } from 'path'
 import type { Message, Session } from '../session'
 import { extractKeywords } from './retrieve'
 
-const HOME = process.env.HOME || '/home/user'
+const HOME = process.env.HOME || '/tmp'
 const STATE_DIR = join(HOME, 'Projects', 'Lomo', 'state', 'memory')
 
 // ── 归档格式 ─────────────────────────────────────────────────────────

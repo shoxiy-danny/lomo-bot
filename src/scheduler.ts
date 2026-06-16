@@ -23,6 +23,7 @@ interface SchedulerDeps {
   findChatId: (role: string) => string | null  // 查找 bot 私聊 chatId
   forceCleanupAllSessions: () => Promise<number>  // 强制清理所有 session，返回清理数量
   runProactiveDecision: () => Promise<void>  // 主动决策触发（v1.0）
+  appendCronToSession: (chatId: string, content: string) => void  // cron 回复追加到 session
 }
 
 let deps: SchedulerDeps | null = null
@@ -93,7 +94,12 @@ async function doTick(): Promise<void> {
       await fireReminder(r)
     } catch (err: any) {
       process.stderr.write(`[scheduler] error firing ${r.type} id=${r.id.slice(0, 8)}: ${err.message}\n`)
-      // 失败不 markFired → 下个 tick 自动重试
+      // cron 失败也推进 fireAt，避免每 30s 死循环重试（如 API 404 等持续性故障）
+      if (r.type === 'cron' && r.cron) {
+        const next = nextCronTime(r.cron, Date.now())
+        markFired(r.id, next)
+        process.stderr.write(`[scheduler] cron id=${r.id.slice(0, 8)}: failed but fireAt advanced to next interval\n`)
+      }
     }
   }
 }
@@ -181,7 +187,7 @@ ${r.prompt}
 请直接执行任务（如需搜索信息请使用 web_search 工具），把最终结果整理好发出来。不要只回复"好的"或"收到"，要给出完整的任务执行结果。`
 
   const options: ChatOptions = {
-    model: r.model || 'deepseek-v4-flash',
+    model: r.model || 'MiniMax-M3',
     maxTokens: 4096,
     temperature: 0.7,
     tools: TOOLS,
@@ -252,7 +258,7 @@ ${r.prompt}
   // 兜底：工具循环后 content 为空 → 追调一次不带工具的 chat 拿文字总结
   if (!finalContent) {
     const fallbackMsg: ChatMessage = { role: 'user', content: '工具调用已达最大轮数或遇到重复错误。请直接以文字回答，不要使用任何工具。根据已有信息和工具执行结果，完整回复用户的问题。' }
-    const fallbackOptions: ChatOptions = { model: r.model || 'deepseek-v4-flash', maxTokens: 4096, temperature: 0.7, tools: [] }
+    const fallbackOptions: ChatOptions = { model: r.model || 'MiniMax-M3', maxTokens: 4096, temperature: 0.7, tools: [] }
     const fallbackResp = await deps.chatFn([...messages, fallbackMsg], fallbackOptions)
     finalContent = fallbackResp.content?.trim() || ''
     process.stderr.write(`[scheduler] cron id=${r.id.slice(0, 8)}: fallback chat (no tools) → ${finalContent.length} chars\n`)
@@ -271,6 +277,12 @@ ${r.prompt}
   }
 
   await deps.sendCard(chatId, finalContent)
+
+  // 进 session：把 cron 回复追加到活跃 session，用户下次对话能看到并继续聊
+  if (r.session) {
+    deps.appendCronToSession(chatId, finalContent)
+  }
+
   const next = nextCronTime(r.cron, Date.now())
   markFired(r.id, next)
   const nextBeijing = new Date(next).toLocaleString('sv', { timeZone: 'Asia/Shanghai' })

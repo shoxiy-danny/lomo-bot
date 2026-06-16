@@ -13,7 +13,7 @@ import { randomUUID } from 'crypto'
 export interface Reminder {
   id: string
   chatId: string        // 飞书 chatId（oc_xxx）
-  role: string          // 角色名
+  role: string          // 角色名（lomo/haha/...）
   delivery: 'fixed' | 'bot_private'  // fixed=发到固定chatId, bot_private=动态查找bot私聊
   type: 'once' | 'cron'
   text?: string         // once: 提醒文字
@@ -22,6 +22,7 @@ export interface Reminder {
   cron?: string         // cron 表达式
   model?: string        // cron 任务执行模型
   preCheck?: string     // 脚本预检：bash 命令；输出以 SILENCE 开头→跳过 LLM，否则输出注入 prompt
+  session?: boolean     // cron 回复是否追加到活跃 session（true=进 session，false/undefined=不进）
   fireAt: number        // 下次触发时间戳 ms
   enabled: boolean
   createdAt: number
@@ -30,7 +31,7 @@ export interface Reminder {
 
 // ── 存储 ─────────────────────────────────────────────────────────
 
-const STATE_DIR = join(process.env.HOME || '/home/user', 'Projects', 'Lomo', 'state')
+const STATE_DIR = join(process.env.HOME || '/tmp', 'Projects', 'Lomo', 'state')
 const FILE_PATH = join(STATE_DIR, 'reminders.json')
 
 function atomicWrite(filePath: string, content: string): void {
@@ -91,8 +92,9 @@ export function getDueReminders(): Reminder[] {
   const todayBeijing = new Date(now + 8 * 3600_000).toISOString().slice(0, 10)
   return loadReminders().filter(r => {
     if (!r.enabled || r.fireAt > now) return false
-    // cron 防重复：今天已 fire 过的跳过
+    // cron 防重复：60s 内或今天已 fire 过的跳过
     if (r.type === 'cron' && r.lastFiredAt) {
+      if (now - r.lastFiredAt < 60_000) return false
       const lastDay = new Date(r.lastFiredAt + 8 * 3600_000).toISOString().slice(0, 10)
       if (lastDay === todayBeijing) return false
     }
@@ -100,7 +102,7 @@ export function getDueReminders(): Reminder[] {
   })
 }
 
-export function updateReminder(id: string, patch: Partial<Pick<Reminder, 'text' | 'label' | 'prompt' | 'cron' | 'model' | 'fireAt' | 'enabled' | 'preCheck'>>): Reminder | null {
+export function updateReminder(id: string, patch: Partial<Pick<Reminder, 'text' | 'label' | 'prompt' | 'cron' | 'model' | 'fireAt' | 'enabled' | 'preCheck' | 'session'>>): Reminder | null {
   const list = loadReminders()
   const r = list.find(x => x.id === id)
   if (!r) return null

@@ -9,7 +9,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs'
 import { join } from 'path'
 
-const HOME = process.env.HOME || '/home/user'
+const HOME = process.env.HOME || '/tmp'
 const STATE_DIR = join(HOME, 'Projects', 'Lomo', 'state', 'memory')
 
 function getDiaryPath(role: string): string {

@@ -2,7 +2,7 @@
  * 异步记忆提取 Worker
  *
  * 触发来源：
- *   1. "记一下"/"别忘了" → 立即 enqueue 单条
+ *   1. OOC "记一下"/"别忘了" → 立即 enqueue 单条
  *   2. 每 10 轮对话消息累积 → 批量 enqueue 一组
  *   3. 会话结束 → 整段会话 enqueue
  *
@@ -193,7 +193,7 @@ export function enqueueBatch10(role: string, model: string, messages: Message[])
   enqueueExtract({ role, model, reason: 'batch10', messages: tail })
 }
 
-/** 立即 enqueue（单条对话，用于"记一下"等意图） */
+/** OOC 立即 enqueue（单条对话） */
 export function enqueueOOC(role: string, model: string, text: string): void {
   // hint 太短时 LLM 可能缺上下文——多给一句话说明这是主人显式要记的
   const content = text.length < 20
@@ -202,7 +202,7 @@ export function enqueueOOC(role: string, model: string, text: string): void {
   enqueueExtract({
     role,
     model,
-    reason: 'hint',
+    reason: 'ooc',
     messages: [{ role: 'user', content, ts: new Date().toISOString() }],
   })
 }
@@ -215,7 +215,7 @@ export async function flushQueue(): Promise<void> {
   }
 }
 
-// ── 记忆意图检测（用于立即触发） ──────────────────────────────────
+// ── 记忆意图检测（用于 OOC 立即触发） ────────────────────────────
 
 /**
  * 从消息文本中检测"记一下"意图。

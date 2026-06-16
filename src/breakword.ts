@@ -1,17 +1,17 @@
 /**
- * 三层消息路由：系统命令 → 指令 → 普通对话
+ * 三层消息路由：破甲词 → 场外指令 → 普通对话
  */
 
 // ── 路由结果类型 ──────────────────────────────────────────────────
 
 export type RouteResult =
   | { mode: 'system'; command: string }
-  | { mode: 'instruction'; instruction: string; userText: string }
-  | { mode: 'chat'; text: string }
+  | { mode: 'ooc'; instruction: string; userText: string }
+  | { mode: 'character'; text: string }
 
-// ── 指令语法 ──────────────────────────────────────────────────────
+// ── OOC 语法 ──────────────────────────────────────────────────────
 
-const INSTRUCTION_PATTERNS = [
+const OOC_PATTERNS = [
   /^[（(]([^）)]+)[）)]$/s,   // （任意内容）或 (任意内容) — 纯圆括号 = 潜台词
 ]
 
@@ -60,7 +60,7 @@ export function routeMessage(
   systemMode: boolean,
 ): RouteResult {
   const trimmed = text.trim()
-  if (!trimmed) return { mode: 'chat', text: '' }
+  if (!trimmed) return { mode: 'character', text: '' }
 
   // 1. 系统模式下所有消息都当系统命令
   if (systemMode) {
@@ -70,32 +70,33 @@ export function routeMessage(
     return { mode: 'system', command: trimmed }
   }
 
-  // 2. 指令检测（括号包裹的内容）
-  for (const pat of INSTRUCTION_PATTERNS) {
+  // 2. 场外指令检测
+  for (const pat of OOC_PATTERNS) {
     const m = trimmed.match(pat)
     if (m) {
-      return { mode: 'instruction', instruction: m[1], userText: '' }
+      return { mode: 'ooc', instruction: m[1], userText: '' }
     }
   }
 
-  // 4. 指令 + 普通消息混合（如 "（xxx）\n普通消息"）
+  // 4. 潜台词 + 普通消息混合（如 "（xxx）\n普通消息"）
   const lines = trimmed.split('\n')
   const firstLine = lines[0].trim()
-  for (const pat of INSTRUCTION_PATTERNS) {
+  for (const pat of OOC_PATTERNS) {
     const m = firstLine.match(pat)
     if (m) {
       const userText = lines.slice(1).join('\n').trim()
-      return { mode: 'instruction', instruction: m[1], userText }
+      return { mode: 'ooc', instruction: m[1], userText }
     }
   }
 
   // 5. 普通消息
-  return { mode: 'chat', text: trimmed }
+  return { mode: 'character', text: trimmed }
 }
 
 // ── 模型别名表（与 CC 一致）────────────────────────────────────────
 
 const MODEL_ALIASES: Record<string, string> = {
+  agn: 'agnes-2.0-flash',
   dsf: 'deepseek-v4-flash',
   dsp: 'deepseek-v4-pro',
   mmx: 'MiniMax-M3',

@@ -31,8 +31,8 @@ import {
   resolveVoiceStyle, VOICE_PRESETS,
 } from './breakword'
 import { chat } from './llm/router'
-import type { ChatMessage, ChatOptions, ChatResponse, ToolCall } from './llm/types'
-import { TOOLS, SEARCH_TOOL, IMAGE_GEN_TOOL, parseToolCalls, parseToolCallXml, stripToolCallXml, executeNativeToolCalls, executeLegacyToolCalls, videoGen, imageGen, type ToolResult } from './tools'
+import type { ChatMessage, ToolCall } from './llm/types'
+import { TOOLS, parseToolCalls, parseToolCallXml, stripToolCallXml, executeNativeToolCalls, executeLegacyToolCalls } from './tools'
 import { saveLocation } from './location'
 import {
   loadProactive, saveProactive, checkHardLimit,
@@ -44,7 +44,7 @@ import { logLlmCall, queryLogs, getStats, getSessionCost } from './llm-log'
 import { PRESETS } from './presets'
 import { listReminders, deleteReminder } from './reminders'
 import { initScheduler, startScheduler, stopScheduler } from './scheduler'
-import { listNotes, deleteNote, migrateOldNotes } from './notes'
+import { listNotes, searchNotes, deleteNote } from './notes'
 import { appendDiaryEntry } from './memory/diary'
 import { archiveSession } from './memory/archive'
 
@@ -170,20 +170,6 @@ function setActiveSession(chatId: string, session: Session): void {
   saveActiveSessions()
 }
 
-/** cron 回复追加到活跃 session（session: true 的定时任务用） */
-function appendCronToSession(chatId: string, content: string): void {
-  const session = getActiveSession(chatId)
-  if (!session) {
-    process.stderr.write(`[cron→session] skip: no active session for ${chatId}\n`)
-    return
-  }
-  const msg: Message = { role: 'assistant', content, ts: new Date().toISOString() }
-  session.messages.push(msg)
-  session.lastActivityAt = new Date().toISOString()
-  saveSession(session)
-  process.stderr.write(`[cron→session] appended ${content.length} chars to session ${session.id.slice(0, 8)}\n`)
-}
-
 // ── 上下文构建 helper（v1：含 postMessages） ─────────────────────
 
 /**
@@ -205,29 +191,35 @@ function isSessionTimedOut(session: Session): boolean {
   return Date.now() - new Date(lastActivity).getTime() > SESSION_TIMEOUT_MS
 }
 
-// ── 模型选择：默认 MiniMax M3，失败退回 DSF ──
+// ── 模型选择：init 阶段 / 工具密集场景强制用 DSF ─────
 
-const FALLBACK_MODEL = 'deepseek-v4-flash'  // DSF：主模型调用失败时的兜底
+const INIT_MODEL = 'deepseek-v4-pro'
+const TOOL_MODEL = 'deepseek-v4-flash'  // DSF：工具调用兜底模型（M3 幻觉严重时切这个）
 
-/** 选 LLM 模型 */
-function pickModelForCall(session: Session, _userText?: string): string {
+// 需要强制 DSF 的关键词（米家控制 / 设备操作）
+const FORCE_DSF_RE = /开灯|关灯|开空调|关空调|开大灯|关大灯|打开.*灯|关闭.*灯|打开.*空调|关闭.*空调|调亮度|调色温|空调\d+度|灯.*开|灯.*关|设备.*开|设备.*关/
+
+// 需要强制 tool_choice={type:'any'} 的查询模式（比 FORCE_DSF_RE 更广）
+// M3 对这些查询经常跳过工具调用直接编造，必须强制至少调一个工具
+const SHOULD_USE_TOOL_RE = /几度|多少度|温度|湿度|开了没|关了吗|状态|亮度|色温|模式|电量|功率|看看.*设备|查.*设备|列.*设备|有什么设备|几个设备|灯.*开了|空调.*开了|米家|mijia|传感器|插座|开关|窗帘|晾衣架|风扇|台灯|夜灯|音箱.*音量|家里.*设备|现在几点|今天几号|搜一下|帮我查|帮我找|搜.*新闻|天气预报|天气怎么样/
+
+/** 选 LLM 模型：profile 未初始化或涉及工具密集操作时强制用 DSF */
+function pickModelForCall(session: Session, userText?: string): string {
   if (!isProfileInitialized(session.characterName)) {
-    return 'MiniMax-M3'
+    return INIT_MODEL
   }
-  return session.model  // 默认 MiniMax-M3（session.ts 设定）
+  // 米家控制意图 → 强制 DSF（M3 幻觉工具调用太严重）
+  if (userText && FORCE_DSF_RE.test(userText)) {
+    process.stderr.write(`[model] force DSF for mijia intent: ${userText.slice(0, 50)}\n`)
+    return TOOL_MODEL
+  }
+  return session.model
 }
 
-/** 带 fallback 的 LLM 调用：先试指定模型，失败自动退 FALLBACK_MODEL */
-async function chatWithFallback(
-  messages: { role: string; content: string }[] | ChatMessage[],
-  options: ChatOptions & { model: string },
-): Promise<ChatResponse> {
-  try {
-    return await chat(messages as any, options as any)
-  } catch (err: any) {
-    console.error(`[model] ${options.model} 调用失败，退至 ${FALLBACK_MODEL}: ${err.message}`)
-    return chat(messages as any, { ...options, model: FALLBACK_MODEL } as any)
-  }
+/** 检测是否需要强制 tool_choice（M3 跳过工具调用的高频场景） */
+function shouldForceToolChoice(userText?: string): boolean {
+  if (!userText) return false
+  return SHOULD_USE_TOOL_RE.test(userText)
 }
 
 function runSessionEndCleanup(session: Session): void {
@@ -358,8 +350,21 @@ async function handleMessage(chatId: string, text: string, senderId: string, mes
   lastUserMsgAt = Date.now()  // 更新最近用户消息时间（主动决策冷却用）
   let session = getActiveSession(chatId)
 
-  // 2 小时超时已关闭：session 只在 4:30 清理或用户按 New 时重建
-  // 保留 isSessionTimedOut 供角色切换场景使用
+  // 1 小时空闲检测：旧会话提取记忆 → 自动开新会话
+  if (session && isSessionTimedOut(session)) {
+    const charName = session.characterName
+    const oldModel = session.model
+    runSessionEndCleanup(session)
+    const preset = PRESETS.find(p => p.id === charName.toLowerCase()) || PRESETS.find(p => p.name === charName)
+    if (preset) {
+      const newSession = createSession(preset.name, preset.persona, preset.scene, preset.voice, preset.voiceStyle)
+      newSession.model = oldModel
+      setActiveSession(chatId, newSession)
+      saveSession(newSession)
+      session = newSession
+      process.stderr.write(`[memory/timeout] auto-new session for ${charName}\n`)
+    }
+  }
   if (session) {
     session.lastActivityAt = new Date().toISOString()
   }
@@ -578,38 +583,31 @@ async function handleSystemCommand(chatId: string, session: Session, command: st
         await feishuReply(chatId, ok ? '已删除笔记。' : '找不到该笔记。')
         break
       }
-      if (sub === 'cat') {
-        // /note cat → 列出所有分类
-        const { notes } = listNotes()
-        const cats = [...new Set(notes.map(n => n.category))].sort()
-        await feishuReply(chatId, cats.length ? `分类：${cats.join('、')}` : '暂无笔记。')
-        break
-      }
       if (sub) {
         // /note <关键词> → 搜索
-        const { notes, total } = listNotes({ keyword: cmd.args.join(' ') })
+        const notes = searchNotes(cmd.args.join(' '))
         if (notes.length === 0) {
           await feishuReply(chatId, `没有找到与"${cmd.args.join(' ')}"相关的笔记。`)
         } else {
           const lines = notes.map(n => {
             const time = new Date(n.createdAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
             const tags = n.tags.length > 0 ? ` [${n.tags.join(',')}]` : ''
-            return `- [${n.id}] [${n.category}] ${n.content.slice(0, 60)}${tags} (${time})`
+            return `- ${n.content}${tags} (${time}) \`${n.id.slice(0, 8)}\``
           })
-          await feishuCardReply(chatId, `**笔记搜索** (${total})\n${lines.join('\n')}`)
+          await feishuCardReply(chatId, `**笔记搜索** (${notes.length})\n${lines.join('\n')}`)
         }
       } else {
         // /note → 列出最近笔记
-        const { notes, total } = listNotes()
+        const notes = listNotes()
         if (notes.length === 0) {
           await feishuReply(chatId, '暂无笔记。对 Lomo 说"记一下..."即可保存。')
         } else {
           const lines = notes.map(n => {
             const time = new Date(n.createdAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
             const tags = n.tags.length > 0 ? ` [${n.tags.join(',')}]` : ''
-            return `- [${n.id}] [${n.category}] ${n.content.slice(0, 60)}${tags} (${time})`
+            return `- ${n.content}${tags} (${time}) \`${n.id.slice(0, 8)}\``
           })
-          await feishuCardReply(chatId, `**最近笔记** (${total})\n${lines.join('\n')}`)
+          await feishuCardReply(chatId, `**最近笔记** (${notes.length})\n${lines.join('\n')}`)
         }
       }
       break
@@ -624,10 +622,9 @@ async function handleSystemCommand(chatId: string, session: Session, command: st
         await feishuReply(chatId, `模型已切换: **${resolved}**`)
       } else {
         const models = [
-          { label: 'Agnes 2.0 Flash', value: 'agnes-2.0-flash' },
+          { label: 'MiniMax-M3（默认）', value: 'MiniMax-M3' },
           { label: 'DeepSeek V4 Pro', value: 'deepseek-v4-pro' },
           { label: 'DeepSeek V4 Flash', value: 'deepseek-v4-flash' },
-          { label: 'MiniMax-M3', value: 'MiniMax-M3' },
           { label: 'MiMo V2.5 Pro', value: 'mimo-v2.5-pro' },
           { label: 'MiMo V2.5', value: 'mimo-v2.5' },
         ]
@@ -910,7 +907,7 @@ function toolNameToType(n: string): string {
   return 'memory'
 }
 
-const MAX_TOOL_ITERATIONS = 20
+const MAX_TOOL_ITERATIONS = 10
 
 /**
  * 工具调用循环：执行工具 → 拿下一轮 LLM 响应 → 重复，直到 LLM 不再调工具
@@ -924,14 +921,12 @@ async function runToolLoop(
   session: Session,
   chatId: string,
   progressMsgId: string,
-): Promise<{ finalContent: string; images: string[]; videos: string[]; logEntries: Array<{ resp: any; type: 'native' | 'legacy'; calls: any[]; systemPreview: string }> }> {
+): Promise<{ finalContent: string; images: string[]; logEntries: Array<{ resp: any; type: 'native' | 'legacy'; calls: any[]; systemPreview: string }> }> {
   const images: string[] = []
-  const videos: string[] = []
   const logEntries: Array<{ resp: any; type: 'native' | 'legacy'; calls: any[]; systemPreview: string }> = []
   let currentResp: any = initialResp
   let rawReply = detectXmlToolCalls(currentResp)
   const lastErrorSigs: string[] = []  // 连续相同错误检测（防死循环）
-  let stoppedEarly = false  // 被重复错误截断（vs 正常结束或达到最大轮数）
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     const nativeCalls = currentResp.toolCalls && currentResp.toolCalls.length > 0 ? currentResp.toolCalls : []
@@ -939,49 +934,13 @@ async function runToolLoop(
     if (nativeCalls.length === 0 && legacyCalls.length === 0) break
 
     if (nativeCalls.length > 0) {
-      // 分离媒体工具（image_gen + video_gen 统一异步，不阻塞对话）
-      const mediaCalls = nativeCalls.filter((tc: ToolCall) =>
-        tc.function.name === 'image_gen' || tc.function.name === 'video_gen')
-      const otherCalls = nativeCalls.filter((tc: ToolCall) =>
-        tc.function.name !== 'image_gen' && tc.function.name !== 'video_gen')
-
-      if (otherCalls.length > 0) {
-        console.log(`[tools] 轮 ${i + 1} 原生: ${otherCalls.map((t: ToolCall) => t.function.name).join(', ')}`)
-        for (const tc of otherCalls) {
-          const toolType = toolNameToType(tc.function.name)
-          await feishuEditCard(progressMsgId, `- Using ${toolType}... ${getModelPrefix(session.model)}`)
-        }
+      console.log(`[tools] 轮 ${i + 1} 原生: ${nativeCalls.map((t: ToolCall) => t.function.name).join(', ')}`)
+      for (const tc of nativeCalls) {
+        const toolType = toolNameToType(tc.function.name)
+        await feishuEditCard(progressMsgId, `- Using ${toolType}... ${getModelPrefix(session.model)}`)
       }
-
-      // 同步执行非媒体工具
-      let toolResults: ToolResult[] = []
-      if (otherCalls.length > 0) {
-        toolResults = await executeNativeToolCalls(otherCalls, session.characterName, chatId, session)
-      }
-
-      // 异步媒体生成：fire-and-forget，完事后自动发送 + 写 session 占位
-      for (const mc of mediaCalls) {
-        let args: any = {}
-        try { args = JSON.parse(mc.function.arguments) } catch {}
-        const mediaLabel = mc.function.name === 'image_gen' ? 'image' : 'video'
-        console.log(`[tools] 轮 ${i + 1} 异步${mediaLabel}: ${(args.prompt || '').slice(0, 50)}`)
-        await feishuEditCard(progressMsgId, `- Generating ${mediaLabel}... ${getModelPrefix(session.model)}`)
-
-        if (mc.function.name === 'image_gen') {
-          fireAndForgetImage(chatId, args.prompt || '', args.reference_image, session.id)
-        } else {
-          fireAndForgetVideo(chatId, args.prompt || '', args.duration, session.id)
-        }
-
-        toolResults.push({
-          type: mediaLabel as 'image' | 'video',
-          query: args.prompt || '',
-          result: mc.function.name === 'image_gen'
-            ? '图片正在生成，完成后会自动发送。'
-            : '视频正在生成（约1~3分钟），完成后会自动发送。',
-          toolCallId: mc.id,
-        })
-      }
+      const toolResults = await executeNativeToolCalls(nativeCalls, session.characterName, chatId, session)
+      toolResults.filter(r => r.type === 'image' && r.imageUrl).forEach(r => images.push(r.imageUrl!))
 
       // 检测连续相同错误（连续 2 轮同一工具返回同一错误 → 跳出，防死循环）
       let repeatedError = false
@@ -996,22 +955,21 @@ async function runToolLoop(
       if (repeatedError) {
         console.log('[tools] 检测到连续相同错误，停止循环')
         rawReply = stripToolCallXml(rawReply)
-        stoppedEarly = true
         break
       }
 
       const toolMessages: ChatMessage[] = toolResults.map(r => ({
         role: 'tool' as const,
-        content: r.result,
+        content: r.result + (r.imageUrl ? `\n图片: ${r.imageUrl}` : ''),
         tool_call_id: r.toolCallId,
       }))
 
-      const nextResp = await chatWithFallback([
+      const nextResp = await chat([
         { role: 'system', content: system },
         ...baseMessages,
         { role: 'assistant', content: rawReply || '', tool_calls: nativeCalls },
         ...toolMessages,
-      ], { model, maxTokens: 3000, tools: TOOLS })
+      ], { model, maxTokens: 2048, tools: TOOLS })
 
       logEntries.push({ resp: nextResp, type: 'native', calls: nativeCalls, systemPreview: system.slice(0, 3000) })
       currentResp = nextResp
@@ -1029,17 +987,8 @@ async function runToolLoop(
         const toolType = tc.type === 'search' ? 'web_search' : 'image_gen'
         await feishuEditCard(progressMsgId, `- Using ${toolType}... ${getModelPrefix(session.model)}`)
       }
-      // 旧格式：搜索同步执行，图片异步 fire-and-forget
-      const legacyImageCalls = legacyCalls.filter(c => c.type === 'image')
-      const legacySearchCalls = legacyCalls.filter(c => c.type === 'search')
-      for (const lc of legacyImageCalls) {
-        fireAndForgetImage(chatId, lc.query, undefined, session.id)
-      }
-      const toolResults = legacySearchCalls.length > 0 ? await executeLegacyToolCalls(legacySearchCalls) : []
-      // 追加异步图片的"已提交"结果
-      for (const lc of legacyImageCalls) {
-        toolResults.push({ type: 'image', query: lc.query, result: '图片正在生成，完成后会自动发送。' })
-      }
+      const toolResults = await executeLegacyToolCalls(legacyCalls)
+      toolResults.filter(r => r.type === 'image' && r.imageUrl).forEach(r => images.push(r.imageUrl!))
 
       const toolContext = toolResults.map(r => {
         if (r.type === 'search') return `【搜索结果："${r.query}"】\n${r.result}`
@@ -1047,12 +996,12 @@ async function runToolLoop(
         return ''
       }).join('\n\n')
 
-      const nextResp = await chatWithFallback([
+      const nextResp = await chat([
         { role: 'system', content: system },
         ...baseMessages,
         { role: 'assistant', content: rawReply },
         { role: 'user', content: `[系统：以下是工具执行结果，请自然地融入你的回复中，不要提及工具的存在]\n\n${toolContext}` },
-      ], { model, maxTokens: 3000 })
+      ], { model, maxTokens: 2048 })
 
       logEntries.push({ resp: nextResp, type: 'legacy', calls: legacyCalls, systemPreview: system.slice(0, 3000) })
       currentResp = nextResp
@@ -1060,24 +1009,19 @@ async function runToolLoop(
     }
   }
 
-  const hitMaxIterations = currentResp.toolCalls && currentResp.toolCalls.length > 0 && !stoppedEarly
-  if (hitMaxIterations) {
+  if (currentResp.toolCalls && currentResp.toolCalls.length > 0) {
     console.warn(`[tools] 达到最大轮数 ${MAX_TOOL_ITERATIONS}，强制结束`)
   }
 
-  // 兜底：循环后 rawReply 为空/太短，或被截断/重复错误仍有待处理工具 → 追调一次不带工具的 chat 拿文字总结
-  const needsFallback = !rawReply || rawReply.trim().length < 5 || hitMaxIterations || stoppedEarly
-  if (needsFallback) {
-    const reason = stoppedEarly ? '连续相同错误被截断' : hitMaxIterations ? '达到最大轮数被截断' : 'rawReply 为空'
-    console.log(`[tools] ${reason}，触发 fallback chat（无工具）`)
+  // 兜底：循环后 rawReply 为空或太短 → 追调一次不带工具的 chat 拿文字总结
+  if (!rawReply || rawReply.trim().length < 5) {
+    console.log('[tools] rawReply 为空，触发 fallback chat（无工具）')
     try {
-      const fallbackResp = await chatWithFallback([
+      const fallbackResp = await chat([
         { role: 'system', content: system },
         ...baseMessages,
-        { role: 'user', content: hitMaxIterations
-          ? '工具调用已达最大轮数。你必须如实汇报：1) 刚才调了哪些工具 2) 每个工具返回了什么结果或错误 3) 当前结论。禁止说"我现在就去/马上/开工"之类承诺未来行动的话——你没有工具可调了，只能汇报已完成的事。'
-          : '工具调用已达最大轮数或遇到重复错误。你必须如实汇报：1) 刚才调了哪些工具 2) 每个工具返回了什么结果或错误 3) 当前结论。禁止说"我现在就去"之类的承诺。' },
-      ], { model, maxTokens: 3000, tools: [] })
+        { role: 'user', content: '工具调用已达最大轮数或遇到重复错误。请直接以文字回答，不要使用任何工具。' },
+      ], { model, maxTokens: 2048, tools: [] })
       rawReply = fallbackResp.content || ''
     } catch {
       // fallback 也失败，保持原始 rawReply
@@ -1087,7 +1031,6 @@ async function runToolLoop(
   return {
     finalContent: collapseBlankLines(rawReply),
     images,
-    videos,
     logEntries,
   }
 }
@@ -1109,117 +1052,102 @@ async function handleCharacter(chatId: string, session: Session, text: string, s
     progressMsgId = await feishuSendProgress(chatId, 'thinking', session)
   } catch {}
 
-  // 调用 LLM（带原生工具定义，Agnes 主 → DSF fallback）
-  let resp = await chatWithFallback([
-    { role: 'system', content: system },
-    ...messages,
-  ], {
-    model: pickModelForCall(session, text),
-    maxTokens: 3000,
-    tools: TOOLS,
-  })
-
-  // Agnes 兜底：没调工具但需要工具 → 重试加直接指令
-  const NEEDS_TOOL_RE = /天气|新闻|搜|查|找|搜索|开.*灯|关.*灯|空调|多少度|设备|状态|提醒|记住|画图|生图|视频|几点|几号|附近|周边|执行|运行/
-  if (text && NEEDS_TOOL_RE.test(text) && (!resp.toolCalls || resp.toolCalls.length === 0)) {
-    console.log(`[model] Agnes 未调工具，重试: ${text.slice(0, 50)}`)
-    const retryMessages = [...messages]
-    const isVideo = /视频|video|动起来|短视频|做视频/.test(text)
-    if (retryMessages.length > 0 && retryMessages[retryMessages.length - 1].role === 'user') {
-      retryMessages[retryMessages.length - 1].content += isVideo
-        ? '\n（你拥有 video_gen 工具可以直接生成视频。立刻调用 video_gen 工具，不要只回复文字。）'
-        : '\n（请用工具回答，不要只回复文字。不调工具就是在骗老板。）'
-    }
-    resp = await chat([
-      { role: 'system', content: system + '\n\n【重要】' + (isVideo
-        ? '老板要生成视频。你有 video_gen 工具，立刻调用它。不要只回复文字说"好的我去生成"——调了才算做了。'
-        : '老板的问题需要调工具才能回答。立刻调工具，不要只回复文字。') },
-      ...retryMessages,
+  // 调用 LLM（带原生工具定义）
+  try {
+    const resp = await chat([
+      { role: 'system', content: system },
+      ...messages,
     ], {
       model: pickModelForCall(session, text),
-      maxTokens: 3000,
+      maxTokens: 2048,
       tools: TOOLS,
+      ...(shouldForceToolChoice(text) ? { toolChoice: { type: 'any' } as const } : {}),
     })
-  }
 
-  if (resp.usage) {
-    logLlmCall({
-      sessionId: session.id,
-      model: resp.model || session.model,
-      type: 'character',
-      inputTokens: resp.usage.inputTokens || 0,
-      outputTokens: resp.usage.outputTokens || 0,
-      cacheReadTokens: resp.usage.cacheReadInputTokens,
-      inputPreview: text.slice(0, 100),
-      systemPreview: system.slice(0, 3000),
-      rawContent: resp.rawContent,
-    })
-    // 保存真实上下文 token 数（用于进度百分比）
-    if (resp.usage.inputTokens) {
-      session.contextTokens = resp.usage.inputTokens
-      saveSession(session)
-    }
-  }
-
-  // ▶️ 工具调用循环（最多 5 轮）
-  const toolResult = await runToolLoop(resp, messages, system, pickModelForCall(session), session, chatId, progressMsgId)
-  let rawReply = toolResult.finalContent
-  const generatedImages = toolResult.images
-  const generatedVideos = toolResult.videos
-
-  // 记录每轮工具调用
-  for (const entry of toolResult.logEntries) {
-    if (entry.resp.usage) {
+    if (resp.usage) {
       logLlmCall({
         sessionId: session.id,
-        model: entry.resp.model || session.model,
-        type: 'tool',
-        inputTokens: entry.resp.usage.inputTokens || 0,
-        outputTokens: entry.resp.usage.outputTokens || 0,
-        cacheReadTokens: entry.resp.usage.cacheReadInputTokens,
-        inputPreview: `[工具] ${entry.calls.map((c: any) => c.function?.name || c.type).join(', ')}`,
-        systemPreview: entry.systemPreview,
-        rawContent: entry.resp.rawContent,
+        model: resp.model || session.model,
+        type: 'character',
+        inputTokens: resp.usage.inputTokens || 0,
+        outputTokens: resp.usage.outputTokens || 0,
+        cacheReadTokens: resp.usage.cacheReadInputTokens,
+        inputPreview: text.slice(0, 100),
+        systemPreview: system.slice(0, 3000),
+        rawContent: resp.rawContent,
       })
+      // 保存真实上下文 token 数（用于进度百分比）
+      if (resp.usage.inputTokens) {
+        session.contextTokens = resp.usage.inputTokens
+        saveSession(session)
+      }
     }
-  }
 
-  // 提取括号情感
-  // 去掉 LLM 回复里的 [M/D HH:MM] 时间戳前缀
-  const strippedReply = rawReply.replace(/^(\[\d{1,2}\/\d{1,2}\s+\d{2}:\d{2}\]\s*)+/g, '').trim()
-  const { cleanText, styles } = extractVoiceStyle(truncateBrackets(strippedReply || rawReply))
-  const voiceStyle = styles.length > 0 ? resolveVoiceStyle(styles[0]) : ''
+    // ▶️ 工具调用循环（最多 5 轮）
+    const toolResult = await runToolLoop(resp, messages, system, pickModelForCall(session), session, chatId, progressMsgId)
+    let rawReply = toolResult.finalContent
+    const generatedImages = toolResult.images
 
-  // 添加 assistant 消息到历史
-  const assistantMsg: Message = {
-    role: 'assistant',
-    content: rawReply,
-    ts: new Date().toISOString(),
-    voiceStyle: voiceStyle || undefined,
-  }
-  session.messages.push(assistantMsg)
-  saveSession(session)
+    // 记录每轮工具调用
+    for (const entry of toolResult.logEntries) {
+      if (entry.resp.usage) {
+        logLlmCall({
+          sessionId: session.id,
+          model: entry.resp.model || session.model,
+          type: 'tool',
+          inputTokens: entry.resp.usage.inputTokens || 0,
+          outputTokens: entry.resp.usage.outputTokens || 0,
+          cacheReadTokens: entry.resp.usage.cacheReadInputTokens,
+          inputPreview: `[工具] ${entry.calls.map((c: any) => c.function?.name || c.type).join(', ')}`,
+          systemPreview: entry.systemPreview,
+          rawContent: entry.resp.rawContent,
+        })
+      }
+    }
 
-  // 先 Done. 再全量输出文字
-  if (progressMsgId) {
-    await feishuEditCard(progressMsgId, `- Done. [${getModelPrefix(session.model)}-${getContextPct(session)}%]`)
-  }
-  await feishuCardReply(chatId, strippedReply || rawReply)
+    // 去掉 LLM 回复里的 [M/D HH:MM] 时间戳前缀（LLM 从 context 里学到的），显示和 TTS 都用干净文本
+    const strippedReply = rawReply.replace(/^(\[\d{1,2}\/\d{1,2}\s+\d{2}:\d{2}\]\s*)+/g, '').trim()
+    const { cleanText, styles } = extractVoiceStyle(truncateBrackets(strippedReply || rawReply))
+    const voiceStyle = styles.length > 0 ? resolveVoiceStyle(styles[0]) : ''
 
-  // TTS
-  if (ttsEnabled.get(chatId) && cleanText) {
-    const ttsText = stripCodeBlocksForTTS(cleanText)
-    if (ttsText) await sendTTS(chatId, ttsText, session.voice, voiceStyle || session.voiceStyle)
-  }
+    // 添加 assistant 消息到历史
+    const assistantMsg: Message = {
+      role: 'assistant',
+      content: rawReply,
+      ts: new Date().toISOString(),
+      voiceStyle: voiceStyle || undefined,
+    }
+    session.messages.push(assistantMsg)
+    saveSession(session)
 
-  // 图片/视频已在 runToolLoop 中异步发送
+    // 先 Done. 再全量输出文字
+    if (progressMsgId) {
+      await feishuEditCard(progressMsgId, `- Done. [${getModelPrefix(session.model)}-${getContextPct(session)}%]`)
+    }
+    await feishuCardReply(chatId, strippedReply || rawReply)
 
-  const usage = resp.usage
-  if (usage) {
-    const cacheInfo = usage.cacheReadInputTokens
-      ? ` cache_read=${usage.cacheReadInputTokens}`
-      : ''
-    console.log(`[chat] model=${resp.model} in=${usage.inputTokens} out=${usage.outputTokens}${cacheInfo}`)
+    // TTS
+    if (ttsEnabled.get(chatId) && cleanText) {
+      const ttsText = stripCodeBlocksForTTS(cleanText)
+      if (ttsText) await sendTTS(chatId, ttsText, session.voice, voiceStyle || session.voiceStyle)
+    }
+
+    // 发送图片
+    for (const imageUrl of generatedImages) {
+      await feishuSendImage(chatId, imageUrl)
+    }
+
+    const usage = resp.usage
+    if (usage) {
+      const cacheInfo = usage.cacheReadInputTokens
+        ? ` cache_read=${usage.cacheReadInputTokens}`
+        : ''
+      console.log(`[chat] model=${resp.model} in=${usage.inputTokens} out=${usage.outputTokens}${cacheInfo}`)
+    }
+  } catch (err: any) {
+    console.error(`[chat] LLM error: ${err.message}`)
+    await feishuReply(chatId, `模型调用失败: ${err.message}
+发送 /model dsp 切换到 DeepSeek 或 /model mmx 切换到 MiniMax。`)
   }
 }
 
@@ -1243,18 +1171,18 @@ async function handleOOC(chatId: string, session: Session, instruction: string, 
   try { progressMsgId = await feishuSendProgress(chatId, 'thinking', session) } catch {}
 
   try {
-    const resp = await chatWithFallback([
+    const resp = await chat([
       { role: 'system', content: system },
       ...messages,
     ], {
       model: pickModelForCall(session, userText),
-      maxTokens: 3000,
+      maxTokens: 2048,
       tools: TOOLS,
+      ...(shouldForceToolChoice(userText) ? { toolChoice: { type: 'any' } as const } : {}),
     })
 
     let rawReply: string
     let generatedImages: string[]
-    let generatedVideos: string[]
     let toolLogEntries: any[]
 
     if (resp.usage) {
@@ -1279,7 +1207,6 @@ async function handleOOC(chatId: string, session: Session, instruction: string, 
     const toolResult = await runToolLoop(resp, messages, system, pickModelForCall(session), session, chatId, progressMsgId)
     rawReply = toolResult.finalContent
     generatedImages = toolResult.images
-    generatedVideos = toolResult.videos
     toolLogEntries = toolResult.logEntries
 
     // 记录每轮工具调用
@@ -1327,7 +1254,10 @@ async function handleOOC(chatId: string, session: Session, instruction: string, 
       if (ttsText) await sendTTS(chatId, ttsText, session.voice, voiceStyle || session.voiceStyle)
     }
 
-    // 图片/视频已在 runToolLoop 中异步发送
+    // 发送生成的图片
+    for (const imageUrl of generatedImages) {
+      await feishuSendImage(chatId, imageUrl)
+    }
   } catch (err: any) {
     console.error(`[ooc] LLM error: ${err.message}`)
     await feishuReply(chatId, `模型调用失败: ${err.message}`)
@@ -1337,7 +1267,6 @@ async function handleOOC(chatId: string, session: Session, instruction: string, 
 // ── 进度 + 模型前缀辅助 ────────────────────────────────────────────
 
 const MODEL_PREFIXES: Record<string, string> = {
-  'agnes-2.0-flash': 'agn',
   'deepseek-v4-flash': 'dsf',
   'deepseek-v4-pro': 'dsp',
   'MiniMax-M3': 'mmx',
@@ -1507,11 +1436,11 @@ async function transcribeAudio(filePath: string): Promise<string> {
 // ── 飞书消息收发 ──────────────────────────────────────────────────
 
 /**
- * 识图：下载飞书图片 → base64 → Agnes（主）→ MiniMax VLM（fallback）
- * Agnes：agnes-2.0-flash 多模态 chat completions
- * MiniMax VLM：https://api.minimaxi.com/v1/coding_plan/vlm
+ * MiniMax VLM 识图：下载飞书图片 → base64 → VLM 分析 → 返回文字描述
+ * API: https://api.minimaxi.com/v1/coding_plan/vlm
+ * 需 MINIMAX_API_KEY（与对话模型同 key）
  */
-// ── 飞书 Token 缓存（识图直调用） ────────────────────────────────
+// ── 飞书 Token 缓存（VLM 识图直调用） ────────────────────────────
 
 let _feishuToken: { token: string; expiresAt: number } | null = null
 
@@ -1535,16 +1464,17 @@ async function getFeishuToken(): Promise<string> {
 }
 
 async function describeFeishuImage(messageId: string, fileKey: string): Promise<string> {
-  const agnesKey = process.env.AGNES_API_KEY || ''
-  const mmxKey = process.env.MINIMAX_API_KEY || ''
+  const key = process.env.MINIMAX_API_KEY || ''
+  if (!key) return '（识图不可用：未配置 MINIMAX_API_KEY）'
 
-  // 1. 下载图片（直调飞书 API）
+  // 1. 下载图片（直调飞书 API，不经过 SDK 的 messageResource.get 层，避免版本兼容问题）
   let imageBuf: Buffer | null = null
   try {
     const resp = await fetch(
       `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=image`,
       {
         headers: {
+          // 用 SDK 内部的 request 来获取 token（或者直接拿已经缓存的 token）
           'Authorization': `Bearer ${await getFeishuToken()}`,
         },
       },
@@ -1563,53 +1493,18 @@ async function describeFeishuImage(messageId: string, fileKey: string): Promise<
   if (!imageBuf || imageBuf.length === 0) return '（图片为空）'
   if (imageBuf.length > 10 * 1024 * 1024) return '（图片超过 10MB）'
 
-  // 2. base64 → 识图 API（Agnes 主 → MiniMax fallback）
+  // 2. base64 → VLM API
   const b64 = imageBuf.toString('base64')
-  const dataUri = `data:image/png;base64,${b64}`
-
-  // 主路径：Agnes（免费）
-  if (agnesKey) {
-    try {
-      const resp = await fetch('https://apihub.agnes-ai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${agnesKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'agnes-2.0-flash',
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'text', text: '请详细描述这张图片的内容，包括主体、颜色、文字、环境等。如果不是图片，请如实说明。' },
-              { type: 'image_url', image_url: { url: dataUri } },
-            ],
-          }],
-          max_tokens: 2048,
-        }),
-      })
-      if (resp.ok) {
-        const data = await resp.json() as any
-        const content = data.choices?.[0]?.message?.content || ''
-        if (content) return content.trim()
-      }
-    } catch (err: any) {
-      console.error(`[feishu] Agnes 识图失败: ${err.message}`)
-    }
-  }
-
-  // fallback: MiniMax VLM
-  if (!mmxKey) return '（识图不可用）'
   try {
     const resp = await fetch('https://api.minimaxi.com/v1/coding_plan/vlm', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${mmxKey}`,
+        'Authorization': `Bearer ${key}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
         prompt: '请详细描述这张图片的内容，包括主体、颜色、文字、环境等。如果不是图片，请如实说明。',
-        image_url: dataUri,
+        image_url: `data:image/png;base64,${b64}`,
       }),
     })
     if (!resp.ok) {
@@ -1684,88 +1579,8 @@ async function feishuSendImage(chatId: string, imageUrl: string): Promise<void> 
     // 清理临时文件
     try { unlinkSync(tmpPath) } catch {}
   } catch (err: any) {
-    console.error(`[feishu] 图片发送失败: ${err.message}，尝试发链接兜底`)
-    try {
-      await feishuReply(chatId, `图片已生成，但发送失败。你可以直接打开链接查看：\n${imageUrl}`)
-    } catch {}
+    console.error(`[feishu] 图片发送失败: ${err.message}`)
   }
-}
-
-/** 发送视频文件到飞书（用 send_file 上传） */
-async function feishuSendVideo(chatId: string, videoPath: string): Promise<void> {
-  try {
-    // 飞书 SDK 的文件上传
-    const fileResp = await feishuClient.im.file.create({
-      data: { file_type: 'stream', file_name: `video_${Date.now()}.mp4`, file: createReadStream(videoPath) },
-    })
-    const fileKey = fileResp?.file_key
-    if (!fileKey) throw new Error('视频上传飞书失败')
-
-    await feishuClient.im.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: {
-        receive_id: chatId,
-        msg_type: 'file',
-        content: JSON.stringify({ file_key: fileKey }),
-      },
-    })
-
-    // 清理临时文件
-    try { unlinkSync(videoPath) } catch {}
-  } catch (err: any) {
-    console.error(`[feishu] 视频发送失败: ${err.message}，尝试发路径兜底`)
-    try {
-      await feishuReply(chatId, `视频已生成，但发送失败。文件路径：${videoPath}`)
-    } catch {}
-  }
-}
-
-// ── 异步媒体生成（fire-and-forget + session 占位）──────────────
-
-function addSessionPlaceholder(sessionId: string, type: 'image' | 'video', prompt: string): void {
-  try {
-    const s = loadSession(sessionId)
-    if (!s) return
-    const label = type === 'image' ? '图片' : '视频'
-    s.messages.push({
-      role: 'system',
-      content: `[${label}已发送: ${(prompt || '').slice(0, 100)}]`,
-      ts: new Date().toISOString(),
-    })
-    saveSession(s)
-  } catch (err: any) {
-    console.error(`[session] 占位写入失败: ${err.message}`)
-  }
-}
-
-function fireAndForgetImage(chatId: string, prompt: string, referenceImage: string | undefined, sessionId: string): void {
-  imageGen(prompt, referenceImage).then(async ({ text, imageUrl }) => {
-    if (imageUrl) {
-      await feishuSendImage(chatId, imageUrl)
-    } else {
-      await feishuReply(chatId, text)
-    }
-    addSessionPlaceholder(sessionId, 'image', prompt)
-  }).catch(err => {
-    console.error(`[async] 图片生成失败: ${err.message}`)
-    feishuReply(chatId, `图片生成失败: ${err.message}`)
-  })
-}
-
-function fireAndForgetVideo(chatId: string, prompt: string, duration: number | undefined, sessionId: string): void {
-  videoGen(prompt, duration || 6).then(async result => {
-    if (result.videoFile) {
-      await feishuSendVideo(chatId, result.videoFile)
-    } else if (result.downloadUrl) {
-      await feishuReply(chatId, `视频已生成，但下载失败。你可以试试直接打开链接下载：\n${result.downloadUrl}`)
-    } else {
-      await feishuReply(chatId, result.text || '视频生成失败')
-    }
-    addSessionPlaceholder(sessionId, 'video', prompt)
-  }).catch(err => {
-    console.error(`[async] 视频生成失败: ${err.message}`)
-    feishuReply(chatId, `视频生成失败: ${err.message}`)
-  })
 }
 
 // 进度指示（CC 同款格式）
@@ -2049,9 +1864,6 @@ function extractSessionId(pathname: string): string | null {
   return m ? decodeURIComponent(m[1]) : null
 }
 
-// 启动时执行数据迁移
-migrateOldNotes()
-
 Bun.serve({
   port: PORT,
   hostname: '127.0.0.1',
@@ -2206,16 +2018,12 @@ Bun.serve({
             if (sub === 'del' && cmd.args[1]) {
               const ok = deleteNote(cmd.args[1])
               reply = ok ? '已删除笔记。' : '找不到该笔记。'
-            } else if (sub === 'cat') {
-              const { notes } = listNotes()
-              const cats = [...new Set(notes.map(n => n.category))].sort()
-              reply = cats.length ? `分类：${cats.join('、')}` : '暂无笔记。'
             } else if (sub) {
-              const { notes, total } = listNotes({ keyword: cmd.args.join(' ') })
-              reply = notes.length === 0 ? '未找到相关笔记。' : `(${total})\n` + notes.map(n => `- [${n.id}] [${n.category}] ${n.content.slice(0, 60)}`).join('\n')
+              const notes = searchNotes(cmd.args.join(' '))
+              reply = notes.length === 0 ? '未找到相关笔记。' : notes.map(n => `- ${n.content} [${n.id.slice(0, 8)}]`).join('\n')
             } else {
-              const { notes, total } = listNotes()
-              reply = notes.length === 0 ? '暂无笔记。' : `(${total})\n` + notes.map(n => `- [${n.id}] [${n.category}] ${n.content.slice(0, 60)}`).join('\n')
+              const notes = listNotes()
+              reply = notes.length === 0 ? '暂无笔记。' : notes.map(n => `- ${n.content} [${n.id.slice(0, 8)}]`).join('\n')
             }
             break
           }
@@ -2231,10 +2039,10 @@ Bun.serve({
 
       const { system, messages } = buildMessagesForLLM(session)
       try {
-        const resp = await chatWithFallback([
+        const resp = await chat([
           { role: 'system', content: system },
           ...messages,
-        ], { model: pickModelForCall(session), maxTokens: 3000, tools: TOOLS })
+        ], { model: pickModelForCall(session), maxTokens: 2048, tools: TOOLS })
 
         if (resp.usage) {
           logLlmCall({ sessionId: session.id, model: resp.model || session.model, type: 'character', inputTokens: resp.usage.inputTokens || 0, outputTokens: resp.usage.outputTokens || 0, cacheReadTokens: resp.usage.cacheReadInputTokens, inputPreview: text.slice(0, 100), systemPreview: system.slice(0, 3000), rawContent: resp.rawContent })
@@ -2266,7 +2074,7 @@ console.log(`[Lomo] HTTP health on :${PORT}`)
  *   3. 找第一个有 active session 的 chatId
  *   4. 读 session + buildMessagesForLLM
  *   5. 追加 trigger 消息（临时，不写盘）
- *   6. 调 LLM（maxTokens=3000, tools=[web_search, image_gen]，工具循环上限 5 轮）
+ *   6. 调 LLM（maxTokens=512, tools=[]）
  *   7. 判断 SILENCE / 正常 / 异常
  *   8. SILENCE → 记录沉默，session 不动
  *   9. 正常 → checkHardLimit → 追加 session + 发送 + 记录
@@ -2315,64 +2123,20 @@ async function runProactiveDecision(): Promise<void> {
     content: buildTriggerMessage(record),
   }
 
-  // 6. 调 LLM（带搜索/生图工具，工具循环上限 5 轮）
-  const PROACTIVE_TOOLS = [SEARCH_TOOL, IMAGE_GEN_TOOL]
-  const MAX_PROACTIVE_TOOL_ITERATIONS = 5
+  // 6. 调 LLM（缓存命中率高）
   let resp
   try {
-    resp = await chatWithFallback([
+    resp = await chat([
       { role: 'system', content: system },
       ...messages,
       triggerMsg,
-    ], { model: pickModelForCall(session), maxTokens: 3000, tools: PROACTIVE_TOOLS })
+    ], { model: pickModelForCall(session), maxTokens: 512, tools: [] })
   } catch (err: any) {
     process.stderr.write(`[proactive] LLM 调用失败: ${err.message}\n`)
     return
   }
 
-  // 工具循环：搜索同步执行，生图异步 fire-and-forget
-  let currentResp = resp
-  let rawContent = (currentResp.content ?? '').trim()
-  for (let i = 0; i < MAX_PROACTIVE_TOOL_ITERATIONS; i++) {
-    const toolCalls = currentResp.toolCalls ?? []
-    if (toolCalls.length === 0) break
-
-    process.stderr.write(`[proactive] 工具轮 ${i + 1}: ${toolCalls.map(t => t.function.name).join(', ')}\n`)
-    // 生图 → 异步，搜索 → 同步
-    const imageCalls = toolCalls.filter(t => t.function.name === 'image_gen')
-    const otherCalls = toolCalls.filter(t => t.function.name !== 'image_gen')
-    for (const ic of imageCalls) {
-      let args: any = {}
-      try { args = JSON.parse(ic.function.arguments) } catch {}
-      fireAndForgetImage(chatId, args.prompt || '', args.reference_image, session.id)
-    }
-    const toolResults = otherCalls.length > 0 ? await executeNativeToolCalls(otherCalls, session.characterName, chatId, session) : []
-    for (const ic of imageCalls) {
-      let args: any = {}
-      try { args = JSON.parse(ic.function.arguments) } catch {}
-      toolResults.push({ type: 'image', query: args.prompt || '', result: '图片正在生成，完成后会自动发送。', toolCallId: ic.id })
-    }
-
-    const toolMessages = toolResults.map(r => ({
-      role: 'tool' as const,
-      content: r.result,
-      tool_call_id: r.toolCallId,
-    }))
-
-    try {
-      currentResp = await chatWithFallback([
-        { role: 'system', content: system },
-        ...messages,
-        triggerMsg,
-        { role: 'assistant', content: rawContent || '', tool_calls: toolCalls },
-        ...toolMessages,
-      ], { model: pickModelForCall(session), maxTokens: 3000, tools: PROACTIVE_TOOLS })
-      rawContent = (currentResp.content ?? '').trim()
-    } catch (err: any) {
-      process.stderr.write(`[proactive] 工具循环 LLM 调用失败: ${err.message}\n`)
-      break
-    }
-  }
+  const rawContent = (resp.content ?? '').trim()
 
   // 7. 判断 SILENCE
   const silence = isSilence(rawContent)
@@ -2401,7 +2165,7 @@ async function runProactiveDecision(): Promise<void> {
     return
   }
 
-  // 9. 正常发送：追加 session + 发飞书 + TTS + 记录
+  // 9. 正常发送：追加 session + 发飞书 + 记录
   const topic = extractTopic(rawContent)
   session.messages.push({
     role: 'assistant',
@@ -2413,14 +2177,6 @@ async function runProactiveDecision(): Promise<void> {
 
   try {
     await feishuCardReply(chatId, rawContent)
-
-    // 图片已在工具循环中异步发送
-
-    // TTS（如果用户开启了语音回复）
-    if (ttsEnabled.get(chatId) && rawContent) {
-      const ttsText = stripCodeBlocksForTTS(rawContent)
-      if (ttsText) await sendTTS(chatId, ttsText, session.voice || 'mimo_default', session.voiceStyle || 'gentle')
-    }
   } catch (err: any) {
     process.stderr.write(`[proactive] 飞书发送失败: ${err.message}\n`)
     // 消息已写入 session，但不计入成功
@@ -2467,7 +2223,6 @@ initScheduler({
     saveActiveSessions()
     return count
   },
-  appendCronToSession,
 })
 startScheduler()
 

@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rea
 import { join } from 'path'
 import { randomUUID } from 'crypto'
 
-const HOME = process.env.HOME || '/home/user'
+const HOME = process.env.HOME || '/tmp'
 const LOG_DIR = join(HOME, 'Projects', 'Lomo', 'state')
 const LOG_FILE = join(LOG_DIR, 'llm-logs.jsonl')
 const MAX_LOG_LINES = 50000

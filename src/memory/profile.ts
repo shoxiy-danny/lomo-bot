@@ -13,7 +13,7 @@ import type { Profile } from './types'
 import { emptyProfile, roleId } from './types'
 
 const STATE_ROOT = join(
-  process.env.HOME || '/home/user',
+  process.env.HOME || '/tmp',
   'Projects', 'Lomo', 'state', 'memory',
 )
 

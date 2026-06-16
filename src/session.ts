@@ -78,7 +78,7 @@ export interface Session {
 // ── 存储路径 ──────────────────────────────────────────────────────
 
 const STATE_DIR = join(
-  process.env.HOME || '/home/user',
+  process.env.HOME || '/tmp',
   'Projects', 'Lomo', 'state', 'sessions',
 )
 
@@ -95,7 +95,7 @@ export function createSession(
   voice = 'mimo_default',
   voiceStyle = 'gentle',
   model = 'MiniMax-M3',
-  userName = '主人',
+  userName = 'User',
 ): Session {
   const now = new Date().toISOString()
   const session: Session = {
@@ -131,7 +131,7 @@ export function loadSession(id: string): Session | null {
 }
 
 function migrateSession(s: any): Session {
-  if (!s.userName) s.userName = '主人'
+  if (!s.userName) s.userName = 'User'
   if (!s.lastActivityAt) s.lastActivityAt = s.updatedAt || new Date().toISOString()
   return s as Session
 }
