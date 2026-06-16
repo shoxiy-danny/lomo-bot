@@ -37,8 +37,10 @@
 
 | 服务 | 用途 | 获取方式 |
 |------|------|----------|
+| Agnes AI | 多模态对话 + 生图 + 生视频 | [Sapiens AI](https://sapiens-ai.ai) |
 | MiMo | TTS 语音输出 | [MiMo Token Plan](https://token-plan.xiaomimimo.com/) |
 | 豆包 | ASR 语音转写 | [火山引擎](https://console.volcengine.com/) → 豆包 |
+| Claude | 对话（Anthropic API） | [Anthropic Console](https://console.anthropic.com/) |
 | 高德地图 | 周边 POI 搜索 | [高德开放平台](https://lbs.amap.com/) → Web 服务 Key |
 
 ## 第三步：安装与配置
@@ -62,9 +64,13 @@ cp state/.env.example state/.env
 FEISHU_APP_ID=cli_xxxxxxxxxxxx
 FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxx
 
-# LLM（至少配一个）
-DEEPSEEK_API_KEY=sk-xxxxxxxx
+# LLM（至少配一个，默认 MiniMax M3）
 MINIMAX_API_KEY=sk-cp-xxxxxxxxxxxx
+DEEPSEEK_API_KEY=sk-xxxxxxxx
+
+# 可选：Agnes / Claude
+AGNES_API_KEY=sk-xxxxxxxx
+# ANTHROPIC_API_KEY=sk-ant-xxxxxxxx
 
 # 可选：语音
 MIMO_API_KEY=tp-xxxxxxxx
@@ -192,9 +198,9 @@ export const PRESETS: CharacterPreset[] = [
   {
     id: 'lomo',
     name: 'Lomo',
-    persona: `你是 Lomo，主人的私人小秘书...`,
-    scene: `你可能在图书馆翻资料...`,
-    voice: '冰糖',      // TTS 音色
+    persona: `你是 Lomo，一个运行在飞书上的 AI 个人助手...`,
+    scene: `你是一个运行在服务器上的智能助手...`,
+    voice: 'mimo_default',      // TTS 音色
     voiceStyle: 'gentle', // 默认情感
   },
 ]
